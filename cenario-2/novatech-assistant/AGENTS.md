@@ -72,17 +72,36 @@ Every query pipeline implementation must respect these token budgets and retriev
 - Never use non-null assertion (`!`) without a comment explaining the invariant
 
 ### Validation
-- Zod schemas live alongside the boundary they guard (e.g., next to the Function handler, not in `shared/`)
+
+<!-- v2: "alongside" era ambíguo — Copilot definiu schemas em handler.ts; regra agora especifica arquivo dedicado -->
+
+- Zod schemas must live in a dedicated `validator.ts` file inside the Function's directory — never define schemas in `handler.ts` or `response-builder.ts`
 - Always call `.parse()` (throws) at entry points; use `.safeParse()` only when the failure path is handled inline
 
 ### Logging
+
+<!-- v2: derivação de requestId não estava especificada — Copilot usou apenas context.invocationId -->
+
+- Always derive `requestId` from `req.headers.get('x-request-id') ?? context.invocationId`
 - Always log with pino context fields: `{ requestId, userId, module }`
 - Log at `info` for normal flow, `warn` for recoverable anomalies, `error` for failures with stack traces
 - Never log PII (names, emails, document content) — log IDs only
 
+### Response Format
+
+<!-- v2: ausente em v1 — Copilot retornou raw objects e usou authLevel: 'anonymous' -->
+
+- Always return a `{ data, meta: { requestId } }` envelope — never return raw objects or plain strings as response body
+- Never return HTTP 200 with an error inside the body; use 422 for validation errors, 404 for not found, 500 for internal errors
+- Always set `authLevel: 'function'` for endpoints that serve user data; only `/health` uses `authLevel: 'anonymous'`
+
 ### Modules & Boundaries
+
+<!-- v2: withRetry ausente em v1 — Copilot chamou serviços externos sem wrapper de retry -->
+
 - `src/shared/` contains types and utilities with **zero side effects** — no Azure SDK calls, no I/O
 - `src/services/` owns all external service integration; Functions must not call Azure SDKs directly
+- Always wrap every external service call with `withRetry` from `src/shared/` — applies to read operations (search, completion) AND write operations (Cosmos DB saves, updates, deletes)
 - Circular dependencies between modules are forbidden
 
 ### Commits

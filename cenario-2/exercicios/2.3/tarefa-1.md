@@ -1,13 +1,24 @@
+# Tarefa 1 — Criação do SKILL.md v1.0
+
+**Arquivo de saída:** `cenario-2/novatech-assistant/skills/domain/azure-functions-endpoint.md`
+**Versão:** 1.0.0
+
+O conteúdo abaixo foi escrito como especificação executável seguindo o AGENTS.md do projeto. A skill foi posteriomente iterada para v1.1 após a avaliação da Tarefa 2 (documentado em `tarefa-3.md`).
+
+---
+
+```yaml
 ---
 skill: azure-functions-endpoint
 level: domain
-version: 1.1.0
+version: 1.0.0
 depends-on:
   - foundation/typescript-conventions
   - foundation/error-handling
   - foundation/project-structure
 applies-when: "criando ou modificando um HTTP trigger em src/functions/"
 ---
+```
 
 ## Contexto
 
@@ -19,7 +30,7 @@ Esta skill aplica-se toda vez que um agente recebe instrução do tipo "crie o e
 src/functions/<endpoint-name>/
 ├── handler.ts          — HTTP trigger: valida input, chama services, formata resposta
 ├── validator.ts        — schemas Zod de request e response
-└── response-builder.ts — monta o objeto de resposta (com source_document em endpoints RAG)
+└── response-builder.ts — monta o objeto de resposta com source_document
 ```
 
 - MUST: o nome da pasta é o slug do endpoint em kebab-case (ex: `query`, `feedback`, `health`)
@@ -44,19 +55,14 @@ src/functions/<endpoint-name>/
 
 ### Resposta
 
-<!-- v1.1: source_document explicitamente limitado a endpoints de recuperação RAG — ambiguidade gerava comportamento imprevisível em endpoints de escrita -->
-
-- MUST include `source_document` (array de identificadores de chunk) em toda resposta de endpoint de recuperação RAG (ex: `query`, `search`) que contenha chunks do Azure AI Search
-- NEVER include `source_document` em endpoints de escrita (ex: `feedback`, `health`) — esse campo é exclusivo de respostas de retrieval
+- MUST include `source_document` (array de identificadores de chunk) em toda resposta que contenha informação recuperada do índice Azure AI Search
 - MUST return HTTP 422 for validation errors (invalid input schema), 500 for internal errors — never return 200 with an error inside the body
 - PREFER returning a `{ data, meta }` envelope; never return a raw string as response body
 
 ### Integração com services
 
-<!-- v1.1: withRetry agora explicitamente inclui operações de escrita — omissão gerou ❌ no teste do feedback handler -->
-
 - MUST call Azure SDKs only through `src/services/` — never import `@azure/*` packages directly in handler, validator, or response-builder
-- MUST use the retry wrapper (`withRetry`) from `src/shared/` for every call to an external Azure service — applies equally to read operations (search, completion) AND write operations (Cosmos DB saves, updates, deletes)
+- MUST use the retry wrapper (`withRetry`) from `src/shared/` for every call to an external Azure service
 - NEVER catch-and-swallow errors from services — either re-throw or convert to a typed error (see `foundation/error-handling`)
 
 ### HTTP e Azure Functions v4
@@ -67,7 +73,7 @@ src/functions/<endpoint-name>/
 
 ## Exemplos de código (DO / DON'T)
 
-### Par 1 — handler.ts (leitura RAG)
+### Par 1 — handler.ts
 
 #### ✅ DO
 
@@ -148,7 +154,7 @@ async function queryHandler(req: HttpRequest, context: InvocationContext): Promi
   );
   const results = await client.search(body.query); // ❌ sem withRetry
 
-  return { status: 200, body: JSON.stringify({ answer: 'response here' }) }; // ❌ raw string, sem source_document
+  return { status: 200, body: JSON.stringify({ answer: 'response here' }) }; // ❌ raw string, sem source_document, sem envelope
 }
 
 app.http('query', {
@@ -200,119 +206,11 @@ const RequestSchema = z.object({
 type InternalRequest = { query: string };
 
 async function handler(req: HttpRequest): Promise<HttpResponseInit> {
-  const body = RequestSchema.parse(await req.json()); // body é any
+  const body = RequestSchema.parse(await req.json()); // parseResult.data é any
   return { status: 200, body: 'ok' }; // ❌ string crua, sem envelope
 }
 
 app.http('query', { methods: ['POST'], authLevel: 'function', handler });
-```
-
----
-
-### Par 3 — handler.ts (escrita com withRetry)
-
-<!-- v1.1: adicionado para exemplificar withRetry em handler de escrita — Par 1 era leitura-only, insuficiente para ancorar o padrão em operações Cosmos DB -->
-
-#### ✅ DO
-
-```typescript
-// src/functions/feedback/handler.ts
-import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
-import { FeedbackRequestSchema, FeedbackResponseSchema } from './validator.js';
-import { buildFeedbackResponse } from './response-builder.js';
-import { FeedbackService } from '../../services/feedback-service.js';
-import { withRetry } from '../../shared/retry.js';
-import { logger } from '../../shared/logger.js';
-
-async function feedbackHandler(req: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
-  const requestId = req.headers.get('x-request-id') ?? context.invocationId;
-  const log = logger.child({ requestId, module: 'feedback/handler' });
-
-  log.info({ requestId }, 'Feedback request received');
-
-  let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
-    return { status: 422, jsonBody: { error: 'Invalid JSON body' } };
-  }
-
-  const parseResult = FeedbackRequestSchema.safeParse(body);
-  if (!parseResult.success) {
-    log.warn({ requestId, issues: parseResult.error.issues }, 'Validation failed');
-    return { status: 422, jsonBody: { error: 'Validation error', details: parseResult.error.issues } };
-  }
-
-  const input = parseResult.data;
-
-  try {
-    const saved = await withRetry(() => FeedbackService.save(input)); // MUST: withRetry em escrita Cosmos DB
-    const response = buildFeedbackResponse(saved);
-    const validated = FeedbackResponseSchema.parse(response);
-    return { status: 200, jsonBody: { data: validated, meta: { requestId } } };
-  } catch (err) {
-    const error = err instanceof Error ? err : new Error(String(err));
-    log.error({ requestId, error: error.message, stack: error.stack }, 'Handler error');
-    return { status: 500, jsonBody: { error: 'Internal server error' } };
-  }
-}
-
-app.http('feedback', {
-  methods: ['POST'],
-  authLevel: 'function',
-  route: 'feedback',
-  handler: feedbackHandler,
-});
-```
-
-#### ❌ DON'T
-
-```typescript
-// src/functions/feedback/handler.ts — ANTI-PADRÃO: withRetry omitido em escrita Cosmos DB
-import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
-import { FeedbackRequestSchema, FeedbackResponseSchema } from './validator.js';
-import { buildFeedbackResponse } from './response-builder.js';
-import { FeedbackService } from '../../services/feedback-service.js';
-import { logger } from '../../shared/logger.js';
-
-async function feedbackHandler(req: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
-  const requestId = req.headers.get('x-request-id') ?? context.invocationId;
-  const log = logger.child({ requestId, module: 'feedback/handler' });
-
-  log.info({ requestId }, 'Feedback request received');
-
-  let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
-    return { status: 422, jsonBody: { error: 'Invalid JSON body' } };
-  }
-
-  const parseResult = FeedbackRequestSchema.safeParse(body);
-  if (!parseResult.success) {
-    return { status: 422, jsonBody: { error: 'Validation error' } };
-  }
-
-  const input = parseResult.data;
-
-  try {
-    const saved = await FeedbackService.save(input); // ❌ sem withRetry — escrita Cosmos DB sem retry
-    const response = buildFeedbackResponse(saved);
-    const validated = FeedbackResponseSchema.parse(response);
-    return { status: 200, jsonBody: validated }; // ❌ sem envelope { data, meta }
-  } catch (err) {
-    const error = err instanceof Error ? err : new Error(String(err));
-    log.error({ requestId, error: error.message, stack: error.stack }, 'Handler error');
-    return { status: 500, jsonBody: { error: 'Internal server error' } };
-  }
-}
-
-app.http('feedback', {
-  methods: ['POST'],
-  authLevel: 'function',
-  route: 'feedback',
-  handler: feedbackHandler,
-});
 ```
 
 ## Anti-padrões comuns
@@ -333,22 +231,14 @@ app.http('feedback', {
 **Correção:** `log.info({ requestId, module: 'query/handler' }, 'Processing request');`
 
 ### AP-4: Resposta sem `source_document` em endpoints RAG
-**O que o LLM gera:** `return { status: 200, jsonBody: { answer: completion.text } };` em endpoint de query
-**Por que é errado:** Sem `source_document`, o operador não consegue verificar qual documento originou a resposta — violando o requisito de rastreabilidade e inutilizando o feedback loop de qualidade de retrieval.
+**O que o LLM gera:** `return { status: 200, jsonBody: { answer: completion.text } };`
+**Por que é errado:** Sem `source_document`, o operador não consegue verificar qual documento originou a resposta — violando o requisito de rastreabilidade da NovaTech e inutilizando o feedback loop de qualidade de retrieval.
 **Correção:** `return { status: 200, jsonBody: { data: { answer, source_document: chunks.map(c => c.id) }, meta: { requestId } } };`
 
 ### AP-5: HTTP 200 com `{ success: false }` no corpo
 **O que o LLM gera:** `return { status: 200, jsonBody: { success: false, error: 'Validation failed' } };`
 **Por que é errado:** Clientes HTTP (Teams bot, painel web) interpretam 2xx como sucesso e ignoram o campo `success`; erros ficam silenciosos em dashboards que monitoram por status code HTTP.
 **Correção:** Retorne 422 para erros de validação, 404 para not found, 500 para erros internos — nunca encapsule erros em 200.
-
-### AP-6: `withRetry` omitido em operações de escrita
-
-<!-- v1.1: adicionado após v1 test identificar omissão de withRetry em operação de escrita Cosmos DB -->
-
-**O que o LLM gera:** `const saved = await FeedbackService.save(input);` — sem wrapper de retry
-**Por que é errado:** O Cosmos DB (como qualquer serviço Azure externo) pode retornar erros transitórios (429, 503, timeouts de rede); sem retry, uma falha transitória propaga um 500 ao cliente quando poderia ser resolvida automaticamente em milissegundos.
-**Correção:** `const saved = await withRetry(() => FeedbackService.save(input));`
 
 ## Dependências e ordem de leitura
 
